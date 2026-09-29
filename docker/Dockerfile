@@ -7,6 +7,7 @@ WORKDIR /bulk_rna_seq
 # gsutil — needed if any task in this image reads/writes GCS paths directly.
 RUN apt-get update && apt-get install -y \
         curl \
+        git \
         gnupg \
         build-essential \
         python3-dev && \
@@ -16,6 +17,14 @@ RUN apt-get update && apt-get install -y \
         | gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg && \
     apt-get update && apt-get install -y google-cloud-cli && \
     rm -rf /var/lib/apt/lists/*
+
+# Pull the repo's scripts/ folder into the image at a fixed path, so the analysis scripts are
+# available in-container even on a run that doesn't pass build_count_matrix_script/qc_plots_script/
+# run_deseq2_script as WDL File inputs.
+# TODO: confirmed klarman-cell-observatory/bulk_rna_workflow exists and has a scripts/ folder
+# (verified earlier in this conversation); your original Dockerfile pointed at bulk_rna_seq, which
+# I couldn't find under that org — swap the URL below if that name is actually correct.
+RUN git clone --depth 1 https://github.com/klarman-cell-observatory/bulk_rna_workflow.git /bulk_rna_seq/repo
 
 # bulkrna_env.yml is your real env (amyz_bulkrna_env, from the notebook), plus DESeq2/apeglm/
 # pheatmap/ggrepel/pandas/openpyxl/adjusttext added for the three R scripts + the WDL's python
@@ -39,3 +48,4 @@ ENV PATH=/opt/conda/envs/amyz_bulkrna_env/bin:$PATH
 RUN Rscript -e 'library(DESeq2); library(apeglm); library(ggplot2); library(pheatmap); library(RColorBrewer); library(ggrepel); library(stringr); cat("R OK\n")'
 RUN python -c "import pandas, numpy, matplotlib, openpyxl, adjustText; print('python OK')"
 RUN gsutil --version
+RUN ls -la /bulk_rna_seq/repo/scripts/
