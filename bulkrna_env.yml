@@ -4,6 +4,15 @@ channels:
   - conda-forge
   - defaults
 dependencies:
+  # --- added for build_count_matrix.R / qc_plots.R / run_deseq2.R / downstream WDL analysis ---
+  - bioconductor-deseq2
+  - bioconductor-apeglm
+  - r-pheatmap
+  - r-ggrepel
+  - pandas
+  - openpyxl
+  - adjusttext
+  # --- end added block ---
   - _libgcc_mutex=0.1
   - _openmp_mutex=4.5
   - _r-mutex=1.0.1
@@ -436,4 +445,3 @@ dependencies:
   - zlib=1.3.1
   - zstandard=0.23.0
   - zstd=1.5.6
-prefix: /opt/conda/envs/amyz_bulkrna_env
