@@ -12,6 +12,10 @@ dependencies:
   - pandas
   - openpyxl
   - adjusttext
+  # firecloud (FISS) isn't on conda-forge/bioconda — pip is the only distribution channel.
+  # `pip=24.2` is already a dependency above, so this just uses it.
+  - pip:
+      - firecloud
   # --- end added block ---
   - _libgcc_mutex=0.1
   - _openmp_mutex=4.5

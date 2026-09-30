@@ -1,0 +1,8 @@
+version: 1.2
+workflows:
+  - name: tbulkrnaseq
+    subclass: WDL
+    primaryDescriptorPath: /bulk_rnaseq_pipeline.wdl
+    authors:
+      - name: Eric Chen
+        email: chene@broadinstitute.org
