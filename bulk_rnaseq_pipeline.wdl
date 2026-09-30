@@ -1,55 +1,5 @@
 version 1.0
 
-## bulk_rnaseq_pipeline.wdl
-##
-## ── The FISS/data-table question, resolved ──────────────────────────────────────────────────
-## `bulk_rna_seq` is called as a NESTED call inside this same Cromwell run (import + `call`), not
-## launched as a separate Terra submission against a data table. That means:
-##   - No `this.<column>` syntax anywhere — that's Terra method-config templating, only meaningful
-##     when Terra itself launches a workflow against table rows. It doesn't apply inside a `call`.
-##   - No FISS upload in the critical path — `build_fastq_table` hands the scatter below a plain
-##     JSON manifest directly. Nothing waits on Terra having ingested anything.
-##   - No retry-depth globbing over `call-run_rsem/attempt-N/...` in `analysis` — that pattern
-##     only exists when you're scraping a *separate* submission's raw execution bucket. Here,
-##     `bulk_rna_seq.rsem_gene` is just a clean `Array[File]` Cromwell hands back directly,
-##     already resolved past whatever retries happened internally.
-## `upload_fastq_table_to_terra` below is kept as an OPTIONAL, best-effort side output (so the
-## table is still browsable in Terra's DATA tab / rerunnable by hand later) — nothing downstream
-## reads it back. That's what breaks the circularity: "table exists for humans to look at" and
-## "table is required input for the next step" are no longer the same thing.
-##
-## ── Checkpoints ──────────────────────────────────────────────────────────────────────────────
-## Two breakpoints, one per expensive external call, each skippable so a rerun doesn't redo work
-## that already succeeded:
-##   1. Post-bcl_convert: `output_directory` is a path YOU choose, so it's checkable.
-##      `detect_existing_bcl_output` does a cheap `gsutil stat` on it before anything else runs;
-##      bcl_convert is skipped automatically if `bcl_fastqs.txt` is already there. Override with
-##      `force_rerun_bcl_convert = true`, or hard-disable with `run_bcl_convert = false`.
-##      `build_fastq_table` always runs regardless — it just reads whatever's at
-##      `output_directory`, whether freshly written this run or already there from a previous one.
-##   2. Post-bulk_rna_seq: jgould's outputs land in Cromwell's own submission directories, not a
-##      path you chose or can predict, so there's nothing to check the way bcl_convert's output
-##      can be. This one is explicit-only: `run_alignment = false` + the four `existing_rsem_*`/
-##      `existing_sample_names` inputs substitute RSEM output you already have. Leaving those unset
-##      while skipping fails immediately (via `select_first`) rather than silently doing nothing.
-##
-## ── Other open items, carried over ──────────────────────────────────────────────────────────
-## - reference_build mapping: using GRCm38_ens93filt / GRCh38_ens93filt (matches what I verified
-##   of bulk_rna_seq's actual accepted `reference` values) — confirm this is right, not GRCm39.
-## - Import URLs resolve correctly (Terra's own validator confirmed both). Confirmed so far, from
-##   Terra's own error messages rather than guesswork:
-##     bulk_rna_seq_wdl.bulk_rna_seq — entry point name correct; ALL its outputs used here
-##       (rsem_gene, rsem_isoform, aligner_log) confirmed to exist, alongside rsem_trans_bam,
-##       rsem_time, rsem_cnt, rsem_model, rsem_theta, rsem_genome_bam.
-##     bcl_convert_wdl.run_bcl_convert — entry point name (NOT `bcl_convert`, an earlier wrong
-##       guess). Its real output is named `fastqs` (NOT `output_directory`, also a wrong earlier
-##       guess) — used only as an untyped dependency marker below via defined(), since its actual
-##       type isn't known yet. Worth a look once visible in Terra's UI: if `fastqs` is a clean
-##       File/Array[File] of the demuxed FASTQs, build_fastq_table's gsutil-listing-and-retry logic
-##       below might be replaceable by just consuming that output directly — not doing that rewrite
-##       now since its shape is still unknown, but flagging it as a likely simplification.
-##   Still unverified: run_bcl_convert's input names (input_bcl_directory, output_directory,
-##   sample_sheet) — taken from earlier whiteboard notes, not yet confirmed by Terra.
 import "https://api.firecloud.org/ga4gh/v1/tools/kco:bcl_convert/versions/12/plain-WDL/descriptor" as bcl_convert_wdl
 import "https://api.firecloud.org/ga4gh/v1/tools/jgould:bulk_rna_seq/versions/17/plain-WDL/descriptor" as bulk_rna_seq_wdl
 
@@ -215,7 +165,7 @@ workflow bulk_rnaseq_pipeline {
   Array[File] rsem_gene_results = select_first([bulk_rna_seq.rsem_gene, existing_rsem_gene_results])
   Array[File] rsem_isoform_results = select_first([bulk_rna_seq.rsem_isoform, existing_rsem_isoform_results])
   Array[File] aligner_logs = select_first([bulk_rna_seq.aligner_log, existing_aligner_logs])
-  Array[String] sample_names_final = if run_alignment then fastq_table.sample_name else select_first([existing_sample_names])
+  Array[String] sample_names_final = if run_alignment then build_fastq_table.sample_names_ordered else select_first([existing_sample_names])
 
   # ================================================================================================
   # Stage 4 — downstream analysis: one task, one container, run to completion.
@@ -492,7 +442,8 @@ if missing:
 
 with open("~{experiment_name}_fastq_table.json", "w") as f:
     json.dump(table, f)
-
+with open("~{experiment_name}_sample_names.txt", "w") as f:
+    f.write("\n".join(row["sample_name"] for row in table)
 with open("~{experiment_name}_fastq_table.tsv", "w") as f:
     f.write(f'entity:~{experiment_name}_id\tread1\tread2\n')
     for row in table:
@@ -505,6 +456,7 @@ PYEOF
   output {
     File fastq_table_json = "~{experiment_name}_fastq_table.json"
     File fastq_table_tsv = "~{experiment_name}_fastq_table.tsv"
+    Array[String] sample_names_ordered = read_lines("~{experiment_name}_sample_names.txt")
   }
 
   runtime {
