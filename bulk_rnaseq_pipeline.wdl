@@ -36,7 +36,20 @@ version 1.0
 ## ── Other open items, carried over ──────────────────────────────────────────────────────────
 ## - reference_build mapping: using GRCm38_ens93filt / GRCh38_ens93filt (matches what I verified
 ##   of bulk_rna_seq's actual accepted `reference` values) — confirm this is right, not GRCm39.
-## - Both import URLs still unverified (Terra auth wall) — same caveat as every earlier draft.
+## - Import URLs resolve correctly (Terra's own validator confirmed both). Confirmed so far, from
+##   Terra's own error messages rather than guesswork:
+##     bulk_rna_seq_wdl.bulk_rna_seq — entry point name correct; ALL its outputs used here
+##       (rsem_gene, rsem_isoform, aligner_log) confirmed to exist, alongside rsem_trans_bam,
+##       rsem_time, rsem_cnt, rsem_model, rsem_theta, rsem_genome_bam.
+##     bcl_convert_wdl.run_bcl_convert — entry point name (NOT `bcl_convert`, an earlier wrong
+##       guess). Its real output is named `fastqs` (NOT `output_directory`, also a wrong earlier
+##       guess) — used only as an untyped dependency marker below via defined(), since its actual
+##       type isn't known yet. Worth a look once visible in Terra's UI: if `fastqs` is a clean
+##       File/Array[File] of the demuxed FASTQs, build_fastq_table's gsutil-listing-and-retry logic
+##       below might be replaceable by just consuming that output directly — not doing that rewrite
+##       now since its shape is still unknown, but flagging it as a likely simplification.
+##   Still unverified: run_bcl_convert's input names (input_bcl_directory, output_directory,
+##   sample_sheet) — taken from earlier whiteboard notes, not yet confirmed by Terra.
 import "https://api.firecloud.org/ga4gh/v1/tools/kco:bcl_convert/versions/12/plain-WDL/descriptor" as bcl_convert_wdl
 import "https://api.firecloud.org/ga4gh/v1/tools/jgould:bulk_rna_seq/versions/17/plain-WDL/descriptor" as bulk_rna_seq_wdl
 
@@ -149,9 +162,11 @@ workflow bulk_rnaseq_pipeline {
 
   # Dependency-forcing only — waits for bcl_convert when it actually ran; inert otherwise, since
   # output_directory's contents are already in place from a previous run.
-  # TODO: swap `bcl_convert.output_directory` for its real declared output once you can see it in
-  # Terra's Outputs panel.
-  String bcl_dependency = select_first([bcl_convert.output_directory, output_directory])
+  # bcl_convert's real output is named `fastqs` (confirmed by Terra's own validator), but its type
+  # is still unknown, so this uses defined() rather than select_first(): defined() only needs an
+  # optional value to check against (any type), where select_first() would need bcl_convert.fastqs
+  # and the fallback to share a type — which we can't guarantee without knowing fastqs's type.
+  Boolean bcl_convert_done = defined(bcl_convert.fastqs)
 
   # ================================================================================================
   # Stage 2 — fastq table (plain WDL data; the Terra upload below is a side-output only).
@@ -163,7 +178,7 @@ workflow bulk_rnaseq_pipeline {
       output_directory = output_directory,
       input_xlsx = input_xlsx,
       experiment_name = experiment_name,
-      bcl_convert_completion_marker = bcl_dependency,
+      bcl_convert_completion_marker = bcl_convert_done,
       docker = downstream_docker
   }
 
@@ -425,7 +440,7 @@ task build_fastq_table {
     String output_directory
     File input_xlsx
     String experiment_name
-    String bcl_convert_completion_marker # unused value; forces ordering after bcl_convert
+    Boolean bcl_convert_completion_marker # unused value; forces ordering after bcl_convert
     String docker
   }
 
