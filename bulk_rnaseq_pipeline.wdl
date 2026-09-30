@@ -1,5 +1,45 @@
+Here's the full file inline:
+
+```wdl
 version 1.0
 
+## bulk_rnaseq_pipeline.wdl
+##
+## ── The FISS/data-table question, resolved ──────────────────────────────────────────────────
+## `bulk_rna_seq` is called as a NESTED call inside this same Cromwell run (import + `call`), not
+## launched as a separate Terra submission against a data table. That means:
+##   - No `this.<column>` syntax anywhere — that's Terra method-config templating, only meaningful
+##     when Terra itself launches a workflow against table rows. It doesn't apply inside a `call`.
+##   - No FISS upload in the critical path — `build_fastq_table` hands the scatter below a plain
+##     JSON manifest directly. Nothing waits on Terra having ingested anything.
+##   - No retry-depth globbing over `call-run_rsem/attempt-N/...` in `analysis` — that pattern
+##     only exists when you're scraping a *separate* submission's raw execution bucket. Here,
+##     `bulk_rna_seq.rsem_gene` is just a clean `Array[File]` Cromwell hands back directly,
+##     already resolved past whatever retries happened internally.
+## `upload_fastq_table_to_terra` below is kept as an OPTIONAL, best-effort side output (so the
+## table is still browsable in Terra's DATA tab / rerunnable by hand later) — nothing downstream
+## reads it back. That's what breaks the circularity: "table exists for humans to look at" and
+## "table is required input for the next step" are no longer the same thing.
+##
+## ── Checkpoints ──────────────────────────────────────────────────────────────────────────────
+## Two breakpoints, one per expensive external call, each skippable so a rerun doesn't redo work
+## that already succeeded:
+##   1. Post-bcl_convert: `output_directory` is a path YOU choose, so it's checkable.
+##      `detect_existing_bcl_output` does a cheap `gsutil stat` on it before anything else runs;
+##      bcl_convert is skipped automatically if `bcl_fastqs.txt` is already there. Override with
+##      `force_rerun_bcl_convert = true`, or hard-disable with `run_bcl_convert = false`.
+##      `build_fastq_table` always runs regardless — it just reads whatever's at
+##      `output_directory`, whether freshly written this run or already there from a previous one.
+##   2. Post-bulk_rna_seq: jgould's outputs land in Cromwell's own submission directories, not a
+##      path you chose or can predict, so there's nothing to check the way bcl_convert's output
+##      can be. This one is explicit-only: `run_alignment = false` + the four `existing_rsem_*`/
+##      `existing_sample_names` inputs substitute RSEM output you already have. Leaving those unset
+##      while skipping fails immediately (via `select_first`) rather than silently doing nothing.
+##
+## ── Other open items, carried over ──────────────────────────────────────────────────────────
+## - reference_build mapping: using GRCm38_ens93filt / GRCh38_ens93filt (matches what I verified
+##   of bulk_rna_seq's actual accepted `reference` values) — confirm this is right, not GRCm39.
+## - Both import URLs still unverified (Terra auth wall) — same caveat as every earlier draft.
 import "https://api.firecloud.org/ga4gh/v1/tools/kco:bcl_convert/versions/12/plain-WDL/descriptor" as bcl_convert_wdl
 import "https://api.firecloud.org/ga4gh/v1/tools/jgould:bulk_rna_seq/versions/17/plain-WDL/descriptor" as bulk_rna_seq_wdl
 
@@ -217,7 +257,7 @@ task detect_existing_bcl_output {
 
   command <<<
     set -uo pipefail
-    if gsutil -q stat "~{output_directory%/}/bcl_fastqs.txt"; then
+    if gsutil -q stat "~{sub(output_directory, "/$", "")}/bcl_fastqs.txt"; then
       echo "true" > exists.txt
     else
       echo "false" > exists.txt
@@ -288,8 +328,8 @@ with open("~{experiment_name}_bcl_convert_samplesheet.csv", "w") as f:
 PYEOF
 
     gsutil cp "~{experiment_name}_bcl_convert_samplesheet.csv" \
-        "~{output_directory%/}/inputs/~{experiment_name}_bcl_convert_samplesheet.csv"
-    echo -n "~{output_directory%/}/inputs/~{experiment_name}_bcl_convert_samplesheet.csv" > sample_sheet_path.txt
+        "~{sub(output_directory, "/$", "")}/inputs/~{experiment_name}_bcl_convert_samplesheet.csv"
+    echo -n "~{sub(output_directory, "/$", "")}/inputs/~{experiment_name}_bcl_convert_samplesheet.csv" > sample_sheet_path.txt
 
     python3 <<'PYEOF'
 import json
@@ -403,7 +443,7 @@ task build_fastq_table {
     # without seeing its descriptor). If every listing attempt below comes up short, that's the
     # signal something upstream is genuinely wrong, not just slow.
     for attempt in 1 2 3; do
-      gsutil ls -r "~{output_directory%/}/**" > all_files.txt || true
+      gsutil ls -r "~{sub(output_directory, "/$", "")}/**" > all_files.txt || true
       n_fastqs=$(grep -c '\.fastq\.gz$' all_files.txt || true)
       if [ "${n_fastqs:-0}" -gt 0 ]; then
         break
@@ -682,3 +722,4 @@ PYEOF
     disks: "local-disk 50 HDD"
   }
 }
+```
