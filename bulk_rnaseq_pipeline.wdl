@@ -1,6 +1,3 @@
-Here's the full file inline:
-
-```wdl
 version 1.0
 
 ## bulk_rnaseq_pipeline.wdl
@@ -722,4 +719,3 @@ PYEOF
     disks: "local-disk 50 HDD"
   }
 }
-```
