@@ -139,7 +139,7 @@ workflow bulk_rnaseq_pipeline {
   Boolean do_bcl_convert = run_bcl_convert && (force_rerun_bcl_convert || !detect_existing_bcl_output.exists)
 
   if (do_bcl_convert) {
-    call bcl_convert_wdl.bcl_convert as bcl_convert {
+    call bcl_convert_wdl.run_bcl_convert as bcl_convert {
       input:
         input_bcl_directory = input_bcl_directory,
         output_directory = output_directory,
