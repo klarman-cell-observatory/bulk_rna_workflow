@@ -1,6 +1,6 @@
 version: 1.2
 workflows:
-  - name: tbulkrnaseq
+  - name: bulkrnaseq
     subclass: WDL
     primaryDescriptorPath: /bulk_rnaseq_pipeline.wdl
     authors:
