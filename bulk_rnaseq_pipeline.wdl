@@ -267,7 +267,18 @@ RC_I5 = "~{rc_i5}" == "true"
 _RC = str.maketrans("ACGTacgt", "TGCAtgca")
 def revcomp(s): return s.translate(_RC)[::-1]
 
-ss = pd.read_excel(XLSX, sheet_name="Samplesheet")
+def read_samplesheet(xlsx_path):
+    # Prefer a sheet literally named "Samplesheet"; fall back to "whichever one sheet exists"
+    # for workbooks (like the real bulk_rna_nw.xlsx-style ones) that just have one unnamed sheet.
+    names = pd.ExcelFile(xlsx_path).sheet_names
+    by_lower = {n.strip().lower(): n for n in names}
+    if "samplesheet" in by_lower:
+        return pd.read_excel(xlsx_path, sheet_name=by_lower["samplesheet"])
+    if len(names) == 1:
+        return pd.read_excel(xlsx_path, sheet_name=names[0])
+    raise SystemExit(f"No sheet named 'Samplesheet' and the workbook has multiple sheets {names} — rename the sample data sheet to 'Samplesheet', or leave only one sheet.")
+
+ss = read_samplesheet(XLSX)
 required = ["Sample_Name", "index", "index2", "Sample_Group", "Organism"]
 missing = [c for c in required if c not in ss.columns]
 if missing:
@@ -297,8 +308,17 @@ PYEOF
 import json
 import pandas as pd
 
+def read_samplesheet(xlsx_path):
+    names = pd.ExcelFile(xlsx_path).sheet_names
+    by_lower = {n.strip().lower(): n for n in names}
+    if "samplesheet" in by_lower:
+        return pd.read_excel(xlsx_path, sheet_name=by_lower["samplesheet"])
+    if len(names) == 1:
+        return pd.read_excel(xlsx_path, sheet_name=names[0])
+    raise SystemExit(f"No sheet named 'Samplesheet' and the workbook has multiple sheets {names} — rename the sample data sheet to 'Samplesheet', or leave only one sheet.")
+
 XLSX = "~{input_xlsx}"
-ss = pd.read_excel(XLSX, sheet_name="Samplesheet")
+ss = read_samplesheet(XLSX)
 ss["Sample_Name"] = ss["Sample_Name"].astype(str).str.strip()
 
 # ---- reference_build, from Organism. Must be uniform — one `reference` value serves the whole run. ----
@@ -418,7 +438,16 @@ task build_fastq_table {
 import json
 import pandas as pd
 
-ss = pd.read_excel("~{input_xlsx}", sheet_name="Samplesheet")
+def read_samplesheet(xlsx_path):
+    names = pd.ExcelFile(xlsx_path).sheet_names
+    by_lower = {n.strip().lower(): n for n in names}
+    if "samplesheet" in by_lower:
+        return pd.read_excel(xlsx_path, sheet_name=by_lower["samplesheet"])
+    if len(names) == 1:
+        return pd.read_excel(xlsx_path, sheet_name=names[0])
+    raise SystemExit(f"No sheet named 'Samplesheet' and the workbook has multiple sheets {names} — rename the sample data sheet to 'Samplesheet', or leave only one sheet.")
+
+ss = read_samplesheet("~{input_xlsx}")
 sample_names = ss["Sample_Name"].astype(str).str.strip().tolist()
 
 with open("all_files.txt") as f:
@@ -442,8 +471,14 @@ if missing:
 
 with open("~{experiment_name}_fastq_table.json", "w") as f:
     json.dump(table, f)
+
+# sample_name list, same order as the table above — a separate plain output rather than
+# projecting `.sample_name` out of the Array[FastqTableEntry] later: that dot-into-an-array
+# syntax only works for scattered call outputs (e.g. bulk_rna_seq.rsem_gene), not for a plain
+# user-defined struct array like fastq_table.
 with open("~{experiment_name}_sample_names.txt", "w") as f:
-    f.write("\n".join(row["sample_name"] for row in table)
+    f.write("\n".join(row["sample_name"] for row in table))
+
 with open("~{experiment_name}_fastq_table.tsv", "w") as f:
     f.write(f'entity:~{experiment_name}_id\tread1\tread2\n')
     for row in table:

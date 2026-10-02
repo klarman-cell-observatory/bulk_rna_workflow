@@ -1,4 +1,4 @@
-name: amyz_bulkrna_env
+name: bulkrna_env
 channels:
   - bioconda
   - conda-forge

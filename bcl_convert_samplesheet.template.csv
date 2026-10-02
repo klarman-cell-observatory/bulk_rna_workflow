@@ -1,0 +1,10 @@
+[Header]
+FileFormatVersion,2,
+
+[BCLConvert_Settings]
+CreateFastqForIndexReads,0,
+SoftwareVersion,{{BCLCONVERT_SOFTWARE_VERSION}},
+
+[BCLConvert_Data]
+Sample_ID,index,index2
+{{SAMPLE_ROWS}}
