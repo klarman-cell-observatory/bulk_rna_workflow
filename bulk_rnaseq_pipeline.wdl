@@ -11,77 +11,42 @@ struct FastqTableEntry {
 
 workflow bulk_rnaseq_pipeline {
   input {
-    # ============================================================================================
-    # General
-    # ============================================================================================
-    # Used as a naming/prefix variable across generated artifacts (the BCLConvert samplesheet,
-    # the exported fastq table, the Terra entity-id column) so everything from one run is easy to
-    # trace back to it — not just a Terra-table column name anymore.
     String experiment_name
 
-    # ============================================================================================
-    # Stage 1 — BCL Convert
-    # ============================================================================================
     String input_bcl_directory
     String output_directory
-    File input_xlsx # "Samplesheet" (+ optional "Comparisons") sheets — same shape as before
+    File input_xlsx
     File bcl_samplesheet_template
     String bcl_convert_software_version = "4.2.7"
     Boolean rc_i5 = true
 
-    # Checkpoint 1: skip bcl_convert if output_directory already has results.
-    Boolean run_bcl_convert = true # hard-disable regardless of what's detected
-    Boolean force_rerun_bcl_convert = false # rerun even if output already exists
+    Boolean run_bcl_convert = true
+    Boolean force_rerun_bcl_convert = false
 
-    # ============================================================================================
-    # Stage 2 — fastq table
-    # ============================================================================================
-    Boolean upload_fastq_table_to_terra = false # optional, best-effort, decoupled — see note above
-    # These stay as plain String inputs — a WDL/Cromwell has no built-in notion of "which Terra
-    # workspace is this running in", so there's nothing for the WDL itself to look up at runtime.
-    # BUT Terra's method-configuration UI (separate from this file — the step where you attach/
-    # configure this workflow as a method and set its inputs) lets you bind an input's value
-    # source to the literal `workspace.namespace` / `workspace.name` instead of typing a string.
-    # Set these two inputs that way once, in Terra, and it auto-fills them from wherever the
-    # workflow actually runs — no per-run typing, and the WDL stays portable to non-Terra engines
-    # (where you'd just pass the values directly instead).
-    String? terra_workspace_namespace # required only if upload_fastq_table_to_terra = true
+    Boolean upload_fastq_table_to_terra = false
+    String? terra_workspace_namespace
     String? terra_workspace_name
 
-    # ============================================================================================
-    # Stage 3 — alignment (jgould:bulk_rna_seq)
-    # ============================================================================================
     Boolean output_genome_bam = false
 
-    # Checkpoint 2: skip alignment entirely and substitute RSEM output you already have. Explicit
-    # only — see the header note on why this one can't be auto-detected the way bcl_convert's can.
     Boolean run_alignment = true
     Array[File]? existing_rsem_gene_results
     Array[File]? existing_rsem_isoform_results
     Array[File]? existing_aligner_logs
     Array[String]? existing_sample_names
 
-    # ============================================================================================
-    # Stage 4 — downstream analysis
-    # ============================================================================================
     Float deseq2_padj_thresh = 0.05
     Float deseq2_lfc_thresh = 1.0
-    # Defaults point at the scripts baked into the image (see the Dockerfile — cloned into
-    # /bulk_rna_seq/repo/scripts/). Override any of these if you want to test a modified script
-    # without rebuilding the image.
     String build_count_matrix_script = "/bulk_rna_seq/repo/scripts/build_count_matrix.R"
     String qc_plots_script = "/bulk_rna_seq/repo/scripts/qc_plots.R"
     String run_deseq2_script = "/bulk_rna_seq/repo/scripts/run_deseq2.R"
 
-    # Same image for every task now (generate_bcl_samplesheet / build_fastq_table / analysis) —
-    # simpler to manage than two images, at the cost of a heavier container for the two small
-    # linking tasks than they strictly need.
     String downstream_docker = "gcr.io/genomics-xavier/bulkrnaseq:latest"
   }
 
-  # ================================================================================================
-  # Stage 1 — BCL Convert
-  # ================================================================================================
+  String input_bcl_directory_gcs = if sub(input_bcl_directory, "^gs://.*", "MATCH") == "MATCH" then input_bcl_directory else "gs://" + input_bcl_directory
+  String output_directory_gcs = if sub(output_directory, "^gs://.*", "MATCH") == "MATCH" then output_directory else "gs://" + output_directory
+
   call generate_bcl_samplesheet {
     input:
       experiment_name = experiment_name,
@@ -89,13 +54,13 @@ workflow bulk_rnaseq_pipeline {
       bcl_samplesheet_template = bcl_samplesheet_template,
       bcl_convert_software_version = bcl_convert_software_version,
       rc_i5 = rc_i5,
-      output_directory = output_directory,
+      output_directory = output_directory_gcs,
       docker = downstream_docker
   }
 
   call detect_existing_bcl_output {
     input:
-      output_directory = output_directory,
+      output_directory = output_directory_gcs,
       docker = downstream_docker
   }
 
@@ -104,28 +69,17 @@ workflow bulk_rnaseq_pipeline {
   if (do_bcl_convert) {
     call bcl_convert_wdl.run_bcl_convert as bcl_convert {
       input:
-        input_bcl_directory = input_bcl_directory,
-        output_directory = output_directory,
-        sample_sheet = generate_bcl_samplesheet.sample_sheet_path # String GCS path
+        input_bcl_directory = input_bcl_directory_gcs,
+        output_directory = output_directory_gcs,
+        sample_sheet = generate_bcl_samplesheet.sample_sheet_path
     }
   }
 
-  # Dependency-forcing only — waits for bcl_convert when it actually ran; inert otherwise, since
-  # output_directory's contents are already in place from a previous run.
-  # bcl_convert's real output is named `fastqs` (confirmed by Terra's own validator), but its type
-  # is still unknown, so this uses defined() rather than select_first(): defined() only needs an
-  # optional value to check against (any type), where select_first() would need bcl_convert.fastqs
-  # and the fallback to share a type — which we can't guarantee without knowing fastqs's type.
   Boolean bcl_convert_done = defined(bcl_convert.fastqs)
 
-  # ================================================================================================
-  # Stage 2 — fastq table (plain WDL data; the Terra upload below is a side-output only).
-  # Always runs, whether do_bcl_convert was true this time or output_directory already had
-  # results from a previous run.
-  # ================================================================================================
   call build_fastq_table {
     input:
-      output_directory = output_directory,
+      output_directory = output_directory_gcs,
       input_xlsx = input_xlsx,
       experiment_name = experiment_name,
       bcl_convert_completion_marker = bcl_convert_done,
@@ -144,10 +98,6 @@ workflow bulk_rnaseq_pipeline {
 
   Array[FastqTableEntry] fastq_table = read_json(build_fastq_table.fastq_table_json)
 
-  # ================================================================================================
-  # Stage 3 — alignment. Direct nested call — no `this.`, no data table read-back. Skippable per
-  # checkpoint 2 above; select_first below substitutes existing_* output when run_alignment=false.
-  # ================================================================================================
   if (run_alignment) {
     scatter (e in fastq_table) {
       call bulk_rna_seq_wdl.bulk_rna_seq as bulk_rna_seq {
@@ -167,12 +117,9 @@ workflow bulk_rnaseq_pipeline {
   Array[File] aligner_logs = select_first([bulk_rna_seq.aligner_log, existing_aligner_logs])
   Array[String] sample_names_final = if run_alignment then build_fastq_table.sample_names_ordered else select_first([existing_sample_names])
 
-  # ================================================================================================
-  # Stage 4 — downstream analysis: one task, one container, run to completion.
-  # ================================================================================================
   call analysis {
     input:
-      gene_results = rsem_gene_results, # clean Array[File]; no globbing needed
+      gene_results = rsem_gene_results,
       aligner_logs = aligner_logs,
       sample_names = sample_names_final,
       metadata_all_csv = generate_bcl_samplesheet.metadata_all_csv,
@@ -187,12 +134,26 @@ workflow bulk_rnaseq_pipeline {
       docker = downstream_docker
   }
 
+  call delocalize_outputs {
+    input:
+      output_directory = output_directory_gcs,
+      fastq_table_tsv = build_fastq_table.fastq_table_tsv,
+      count_ensembl_csv = analysis.count_ensembl_csv,
+      count_geneID_csv = analysis.count_geneID_csv,
+      pca_plot = analysis.pca_plot,
+      correlation_heatmap = analysis.correlation_heatmap,
+      qc_flags_csv = analysis.qc_flags_csv,
+      deseq2_results = analysis.deseq2_results,
+      volcano_pngs = analysis.volcano_pngs,
+      metrics_json = analysis.metrics_json,
+      warnings_log = analysis.warnings_log,
+      docker = downstream_docker
+  }
+
   output {
-    # Record-keeping exports — the pipeline itself never reads these back; they're here so a
-    # human (or a separate tool) has a durable, inspectable copy of what was generated.
     File bcl_convert_samplesheet_file = generate_bcl_samplesheet.bcl_convert_samplesheet_file
     String bcl_convert_samplesheet_gcs_path = generate_bcl_samplesheet.sample_sheet_path
-    File fastq_table_tsv = build_fastq_table.fastq_table_tsv # side-artifact; nothing above reads this back
+    File fastq_table_tsv = build_fastq_table.fastq_table_tsv
 
     Array[File] rsem_gene_results_out = rsem_gene_results
     Array[File] rsem_isoform_results_out = rsem_isoform_results
@@ -205,12 +166,11 @@ workflow bulk_rnaseq_pipeline {
     Array[File] volcano_pngs = analysis.volcano_pngs
     File metrics_summary = analysis.metrics_json
     File analysis_warnings_log = analysis.warnings_log
+
+    String results_location = delocalize_outputs.results_location
   }
 }
 
-# =================================================================================================
-# detect_existing_bcl_output — cheap existence check that drives checkpoint 1's auto-skip.
-# =================================================================================================
 task detect_existing_bcl_output {
   input {
     String output_directory
@@ -238,10 +198,6 @@ task detect_existing_bcl_output {
   }
 }
 
-# =================================================================================================
-# generate_bcl_samplesheet — template-filled BCLConvert samplesheet, reference_build from the
-# Organism column, and the metadata/comparisons config the `analysis` task needs later.
-# =================================================================================================
 task generate_bcl_samplesheet {
   input {
     String experiment_name
@@ -268,15 +224,13 @@ _RC = str.maketrans("ACGTacgt", "TGCAtgca")
 def revcomp(s): return s.translate(_RC)[::-1]
 
 def read_samplesheet(xlsx_path):
-    # Prefer a sheet literally named "Samplesheet"; fall back to "whichever one sheet exists"
-    # for workbooks (like the real bulk_rna_nw.xlsx-style ones) that just have one unnamed sheet.
     names = pd.ExcelFile(xlsx_path).sheet_names
     by_lower = {n.strip().lower(): n for n in names}
     if "samplesheet" in by_lower:
         return pd.read_excel(xlsx_path, sheet_name=by_lower["samplesheet"])
     if len(names) == 1:
         return pd.read_excel(xlsx_path, sheet_name=names[0])
-    raise SystemExit(f"No sheet named 'Samplesheet' and the workbook has multiple sheets {names} — rename the sample data sheet to 'Samplesheet', or leave only one sheet.")
+    raise SystemExit(f"No sheet named 'Samplesheet' and the workbook has multiple sheets {names}")
 
 ss = read_samplesheet(XLSX)
 required = ["Sample_Name", "index", "index2", "Sample_Group", "Organism"]
@@ -285,7 +239,6 @@ if missing:
     raise SystemExit(f"Samplesheet sheet is missing required column(s): {missing}")
 ss["Sample_Name"] = ss["Sample_Name"].astype(str).str.strip()
 
-# ---- BCLConvert samplesheet, filled from the template ----
 rows = []
 for _, row in ss.iterrows():
     i5 = revcomp(str(row["index2"]).strip()) if RC_I5 else str(row["index2"]).strip()
@@ -315,20 +268,16 @@ def read_samplesheet(xlsx_path):
         return pd.read_excel(xlsx_path, sheet_name=by_lower["samplesheet"])
     if len(names) == 1:
         return pd.read_excel(xlsx_path, sheet_name=names[0])
-    raise SystemExit(f"No sheet named 'Samplesheet' and the workbook has multiple sheets {names} — rename the sample data sheet to 'Samplesheet', or leave only one sheet.")
+    raise SystemExit(f"No sheet named 'Samplesheet' and the workbook has multiple sheets {names}")
 
 XLSX = "~{input_xlsx}"
 ss = read_samplesheet(XLSX)
 ss["Sample_Name"] = ss["Sample_Name"].astype(str).str.strip()
 
-# ---- reference_build, from Organism. Must be uniform — one `reference` value serves the whole run. ----
 organisms = ss["Organism"].astype(str).str.strip().str.lower().unique()
 if len(organisms) != 1:
     raise SystemExit(f"Organism column must be uniform across all samples; found: {list(organisms)}")
 
-# TODO: confirm these are the exact accepted `reference` values for jgould:bulk_rna_seq — this
-# matches what I verified from the cumulus docs, NOT the GRCm39/GRCh38 shorthand from an earlier
-# whiteboard note. If GRCm39 support is real and different, this mapping needs to change.
 ORGANISM_TO_REFERENCE = {"mouse": "GRCm38_ens93filt", "human": "GRCh38_ens93filt"}
 organism = organisms[0]
 if organism not in ORGANISM_TO_REFERENCE:
@@ -336,11 +285,9 @@ if organism not in ORGANISM_TO_REFERENCE:
 with open("reference_build.txt", "w") as f:
     f.write(ORGANISM_TO_REFERENCE[organism])
 
-# ---- metadata_all.csv: Sample_Name + Sample_Group, for QC/DESeq2 ----
 meta_all = ss[["Sample_Name", "Sample_Group"]]
 meta_all.to_csv("sample_metadata_full.csv", index=False)
 
-# ---- Comparisons sheet (optional) ----
 try:
     comp = pd.read_excel(XLSX, sheet_name="Comparisons")
     have_comparisons = True
@@ -360,12 +307,10 @@ else:
         raise SystemExit(f"Comparisons sheet is missing required column(s): {missing_c}")
     if "exclude_samples" not in comp.columns:
         comp["exclude_samples"] = ""
-    # pandas' groupby silently drops rows with a NaN/blank group key — that would mean a
-    # comparison you actually wanted just vanishes with no error. Catch it here instead.
     blank_set = comp["comparison_set"].isna() | (comp["comparison_set"].astype(str).str.strip() == "")
     if blank_set.any():
         bad_rows = comp[blank_set][["numerator_group", "reference_group"]].values.tolist()
-        raise SystemExit(f"{blank_set.sum()} row(s) have a blank comparison_set and would be silently dropped: {bad_rows}")
+        raise SystemExit(f"{blank_set.sum()} row(s) have a blank comparison_set: {bad_rows}")
     for set_name, sub in comp.groupby("comparison_set"):
         set_name = str(set_name)
         exclude = set()
@@ -385,7 +330,7 @@ PYEOF
 
   output {
     File bcl_convert_samplesheet_file = "~{experiment_name}_bcl_convert_samplesheet.csv"
-    String sample_sheet_path = read_string("sample_sheet_path.txt") # GCS path, matches bcl_convert's String-typed input
+    String sample_sheet_path = read_string("sample_sheet_path.txt")
     String reference_build = read_string("reference_build.txt")
     File metadata_all_csv = "sample_metadata_full.csv"
     Array[String] set_names = read_lines("set_names.txt")
@@ -401,29 +346,18 @@ PYEOF
   }
 }
 
-# =================================================================================================
-# build_fastq_table — lists the predetermined FASTQ output layout, matches by sample_name, emits
-# JSON (used directly by the scatter above) and a Terra-entity-shaped TSV (side-artifact only).
-# =================================================================================================
 task build_fastq_table {
   input {
     String output_directory
     File input_xlsx
     String experiment_name
-    Boolean bcl_convert_completion_marker # unused value; forces ordering after bcl_convert
+    Boolean bcl_convert_completion_marker
     String docker
   }
 
   command <<<
     set -euo pipefail
 
-    # Cromwell already guarantees this task doesn't START until bcl_convert's own task has
-    # EXITED (that's what bcl_convert_completion_marker's dependency edge is for) — the normal
-    # WDL call-dependency mechanism, not polling. This retry is only a defensive margin against
-    # the one thing that guarantee *doesn't* cover: bcl_convert's own internal implementation
-    # returning before it's actually done writing to output_directory (can't rule this out
-    # without seeing its descriptor). If every listing attempt below comes up short, that's the
-    # signal something upstream is genuinely wrong, not just slow.
     for attempt in 1 2 3; do
       gsutil ls -r "~{sub(output_directory, "/$", "")}/**" > all_files.txt || true
       n_fastqs=$(grep -c '\.fastq\.gz$' all_files.txt || true)
@@ -445,7 +379,7 @@ def read_samplesheet(xlsx_path):
         return pd.read_excel(xlsx_path, sheet_name=by_lower["samplesheet"])
     if len(names) == 1:
         return pd.read_excel(xlsx_path, sheet_name=names[0])
-    raise SystemExit(f"No sheet named 'Samplesheet' and the workbook has multiple sheets {names} — rename the sample data sheet to 'Samplesheet', or leave only one sheet.")
+    raise SystemExit(f"No sheet named 'Samplesheet' and the workbook has multiple sheets {names}")
 
 ss = read_samplesheet("~{input_xlsx}")
 sample_names = ss["Sample_Name"].astype(str).str.strip().tolist()
@@ -465,17 +399,11 @@ for name in sample_names:
     table.append({"sample_name": name, "read1": r1, "read2": r2})
 
 if missing:
-    # Genuinely missing samples after the retries above — surface this clearly rather than
-    # silently building a partial table.
-    raise SystemExit(f"No paired FASTQs found for {len(missing)} sample(s) under ~{output_directory}: {missing}")
+    raise SystemExit(f"No paired FASTQs found for {len(missing)} sample(s): {missing}")
 
 with open("~{experiment_name}_fastq_table.json", "w") as f:
     json.dump(table, f)
 
-# sample_name list, same order as the table above — a separate plain output rather than
-# projecting `.sample_name` out of the Array[FastqTableEntry] later: that dot-into-an-array
-# syntax only works for scattered call outputs (e.g. bulk_rna_seq.rsem_gene), not for a plain
-# user-defined struct array like fastq_table.
 with open("~{experiment_name}_sample_names.txt", "w") as f:
     f.write("\n".join(row["sample_name"] for row in table))
 
@@ -502,17 +430,12 @@ PYEOF
   }
 }
 
-# =================================================================================================
-# upload_table_to_terra — OPTIONAL, best-effort. Not in the critical path: nothing above waits on
-# this, and nothing downstream reads its output back. Purely so the table is browsable/rerunnable
-# by hand in Terra's DATA tab later, if you want that.
-# =================================================================================================
 task upload_table_to_terra {
   input {
     File fastq_table_tsv
     String workspace_namespace
     String workspace_name
-    String docker # needs: pip install firecloud
+    String docker
   }
 
   command <<<
@@ -526,9 +449,7 @@ with open("~{fastq_table_tsv}") as f:
 resp = fapi.upload_entities("~{workspace_namespace}", "~{workspace_name}", tsv_text)
 print(resp.status_code, resp.text)
 if resp.status_code >= 300:
-    # Non-fatal on purpose: this task's failure shouldn't be able to fail the pipeline, since
-    # nothing downstream depends on it. Log and move on.
-    print("WARNING: Terra table upload failed — table not available in the DATA tab this run.")
+    print("WARNING: Terra table upload failed.")
 PYEOF
   >>>
 
@@ -544,10 +465,6 @@ PYEOF
   }
 }
 
-# =================================================================================================
-# analysis — count matrix -> QC -> DESeq2 per comparison set -> volcano plots -> metrics.
-# No retry-depth globbing: gene_results/aligner_logs are already clean, resolved Files.
-# =================================================================================================
 task analysis {
   input {
     Array[File] gene_results
@@ -559,7 +476,7 @@ task analysis {
     Array[File] set_metadata_csvs
     Array[File] set_comparisons_jsons
 
-    String build_count_matrix_script # path inside the image, or an overriding File-staged path
+    String build_count_matrix_script
     String qc_plots_script
     String run_deseq2_script
     Float deseq2_padj_thresh
@@ -572,17 +489,14 @@ task analysis {
     set -euo pipefail
     : > warnings.log
 
-    # ---- 1. count matrix ----
     mkdir -p data_dir/counts
     for f in ~{sep=" " gene_results}; do
       cp "$f" data_dir/counts/
     done
     Rscript ~{build_count_matrix_script} data_dir
 
-    # ---- 2. QC plots ----
     Rscript ~{qc_plots_script} data_dir "~{metadata_all_csv}"
 
-    # ---- 3. DESeq2, one call per comparison set; a failed set is logged and skipped ----
     mkdir -p deseq2_results volcano_plots
     set_names=(~{sep=" " set_names})
     metadata_csvs=(~{sep=" " set_metadata_csvs})
@@ -591,11 +505,8 @@ task analysis {
     for i in "${!set_names[@]}"; do
       name="${set_names[$i]}"
       mkdir -p "deseq2_results/${name}"
-      # run_deseq2.R's own JSON parsing doesn't handle an empty `[]` cleanly (it attempts one
-      # bogus comparison instead of running zero) — skip the call outright rather than let that
-      # produce a confusing spurious error in the logs.
       if [ "$(cat "${comparisons_jsons[$i]}")" == "[]" ]; then
-        echo "No comparisons defined for set '${name}' — skipping DESeq2 for this set." >> warnings.log
+        echo "No comparisons defined for set '${name}' — skipping." >> warnings.log
         continue
       fi
       if ! Rscript ~{run_deseq2_script} data_dir "${metadata_csvs[$i]}" "${comparisons_jsons[$i]}" "deseq2_results/${name}" 2>>warnings.log; then
@@ -603,7 +514,6 @@ task analysis {
       fi
     done
 
-    # ---- 4. volcano plots, from whatever *_shrink.csv files exist ----
     python3 <<'PYEOF'
 import glob, json, os
 import numpy as np
@@ -668,7 +578,6 @@ with open("volcano_summary.json", "w") as f:
     json.dump(summary, f)
 PYEOF
 
-    # ---- 5. metrics ----
     python3 <<'PYEOF'
 import json, os
 import pandas as pd
@@ -719,5 +628,47 @@ PYEOF
     cpu: 4
     memory: "16 GB"
     disks: "local-disk 50 HDD"
+  }
+}
+
+task delocalize_outputs {
+  input {
+    String output_directory
+    File fastq_table_tsv
+    File count_ensembl_csv
+    File count_geneID_csv
+    File pca_plot
+    File correlation_heatmap
+    File qc_flags_csv
+    Array[File] deseq2_results
+    Array[File] volcano_pngs
+    File metrics_json
+    File warnings_log
+    String docker
+  }
+
+  command <<<
+    set -euo pipefail
+    DEST="~{sub(output_directory, "/$", "")}/results"
+
+    gsutil cp "~{fastq_table_tsv}" "$DEST/"
+    gsutil cp "~{count_ensembl_csv}" "~{count_geneID_csv}" "$DEST/"
+    gsutil cp "~{pca_plot}" "~{correlation_heatmap}" "$DEST/figures/"
+    gsutil cp "~{qc_flags_csv}" "~{metrics_json}" "~{warnings_log}" "$DEST/"
+    gsutil -m cp ~{sep=" " deseq2_results} "$DEST/deseq2/"
+    gsutil -m cp ~{sep=" " volcano_pngs} "$DEST/figures/"
+
+    echo -n "$DEST" > results_location.txt
+  >>>
+
+  output {
+    String results_location = read_string("results_location.txt")
+  }
+
+  runtime {
+    docker: docker
+    cpu: 2
+    memory: "4 GB"
+    disks: "local-disk 20 HDD"
   }
 }
