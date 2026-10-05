@@ -20,8 +20,9 @@ workflow bulk_rnaseq_pipeline {
     String bcl_convert_software_version = "4.2.7"
     Boolean rc_i5 = true
 
-    Boolean run_bcl_convert = true
+    Boolean run_bcl_convert
     Boolean force_rerun_bcl_convert = false
+    Int bcl_convert_preemptible = 0
 
     Boolean upload_fastq_table_to_terra = false
     String? terra_workspace_namespace
@@ -29,7 +30,7 @@ workflow bulk_rnaseq_pipeline {
 
     Boolean output_genome_bam = false
 
-    Boolean run_alignment = true
+    Boolean run_alignment
     Array[File]? existing_rsem_gene_results
     Array[File]? existing_rsem_isoform_results
     Array[File]? existing_aligner_logs
@@ -71,7 +72,8 @@ workflow bulk_rnaseq_pipeline {
       input:
         input_bcl_directory = input_bcl_directory_gcs,
         output_directory = output_directory_gcs,
-        sample_sheet = generate_bcl_samplesheet.sample_sheet_path
+        sample_sheet = generate_bcl_samplesheet.sample_sheet_path,
+        preemptible = bcl_convert_preemptible
     }
   }
 
@@ -134,6 +136,20 @@ workflow bulk_rnaseq_pipeline {
       docker = downstream_docker
   }
 
+  call generate_report {
+    input:
+      experiment_name = experiment_name,
+      reference_build = generate_bcl_samplesheet.reference_build,
+      metadata_all_csv = generate_bcl_samplesheet.metadata_all_csv,
+      metrics_json = analysis.metrics_json,
+      alignment_rate_histogram = analysis.alignment_rate_histogram,
+      volcano_pngs = analysis.volcano_pngs,
+      set_names = generate_bcl_samplesheet.set_names,
+      set_metadata_csvs = generate_bcl_samplesheet.set_metadata_csvs,
+      output_directory = output_directory_gcs,
+      docker = downstream_docker
+  }
+
   call delocalize_outputs {
     input:
       output_directory = output_directory_gcs,
@@ -143,6 +159,7 @@ workflow bulk_rnaseq_pipeline {
       pca_plot = analysis.pca_plot,
       correlation_heatmap = analysis.correlation_heatmap,
       qc_flags_csv = analysis.qc_flags_csv,
+      alignment_rate_histogram = analysis.alignment_rate_histogram,
       deseq2_results = analysis.deseq2_results,
       volcano_pngs = analysis.volcano_pngs,
       metrics_json = analysis.metrics_json,
@@ -162,12 +179,14 @@ workflow bulk_rnaseq_pipeline {
     File pca_plot = analysis.pca_plot
     File correlation_heatmap = analysis.correlation_heatmap
     File qc_flags_csv = analysis.qc_flags_csv
+    File alignment_rate_histogram = analysis.alignment_rate_histogram
     Array[File] deseq2_results = analysis.deseq2_results
     Array[File] volcano_pngs = analysis.volcano_pngs
     File metrics_summary = analysis.metrics_json
     File analysis_warnings_log = analysis.warnings_log
 
     String results_location = delocalize_outputs.results_location
+    File report_pdf = generate_report.report_pdf
   }
 }
 
@@ -580,7 +599,11 @@ PYEOF
 
     python3 <<'PYEOF'
 import json, os
+import numpy as np
 import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 names = "~{sep=',' sample_names}".split(",")
 log_files = "~{sep=',' aligner_logs}".split(",")
@@ -599,13 +622,50 @@ for name, path in zip(names, log_files):
             wf.write(f"WARNING: could not parse aligner log for {name}: {e}\n")
     aln_rows.append({"sample": name, "pct_uniquely_mapped": pct})
 
+aln_df = pd.DataFrame(aln_rows).dropna(subset=["pct_uniquely_mapped"])
+alignment_summary = {}
+if len(aln_df) > 0:
+    mean_pct = float(aln_df.pct_uniquely_mapped.mean())
+    std_pct = float(aln_df.pct_uniquely_mapped.std()) if len(aln_df) > 1 else 0.0
+    outlier_thresh = mean_pct - 2 * std_pct
+    outliers = aln_df[aln_df.pct_uniquely_mapped < outlier_thresh]["sample"].tolist()
+    alignment_summary = {
+        "mean_pct": mean_pct,
+        "std_pct": std_pct,
+        "min_pct": float(aln_df.pct_uniquely_mapped.min()),
+        "min_sample": aln_df.loc[aln_df.pct_uniquely_mapped.idxmin(), "sample"],
+        "max_pct": float(aln_df.pct_uniquely_mapped.max()),
+        "max_sample": aln_df.loc[aln_df.pct_uniquely_mapped.idxmax(), "sample"],
+        "low_mean_warning": mean_pct < 70,
+        "outlier_threshold_pct": outlier_thresh,
+        "outlier_samples": outliers,
+    }
+    if alignment_summary["low_mean_warning"]:
+        with open("warnings.log", "a") as wf:
+            wf.write(f"WARNING: mean alignment rate {mean_pct:.1f}% is below 70%\n")
+    for s in outliers:
+        with open("warnings.log", "a") as wf:
+            wf.write(f"WARNING: {s} alignment rate is an outlier (>2 SD below run mean)\n")
+
+    fig, ax = plt.subplots(figsize=(6, 5))
+    ax.hist(aln_df.pct_uniquely_mapped, bins=20)
+    ax.set(xlabel="Uniquely mapped reads %", title="STAR Alignment Rate")
+    os.makedirs("data_dir/Figures", exist_ok=True)
+    plt.savefig("data_dir/Figures/alignment_rates.png", dpi=150, bbox_inches="tight")
+    plt.close()
+
 qc_flags_path = "data_dir/Figures/qc_flags.csv"
 qc_flags = pd.read_csv(qc_flags_path).to_dict(orient="records") if os.path.exists(qc_flags_path) else []
 
 with open("volcano_summary.json") as f:
     volcano_summary = json.load(f)
 
-metrics = {"alignment_rates": aln_rows, "qc_flags": qc_flags, "deseq2_volcano_summary": volcano_summary}
+metrics = {
+    "alignment_rates": aln_rows,
+    "alignment_summary": alignment_summary,
+    "qc_flags": qc_flags,
+    "deseq2_volcano_summary": volcano_summary,
+}
 with open("metrics.json", "w") as f:
     json.dump(metrics, f, indent=2)
 PYEOF
@@ -617,6 +677,7 @@ PYEOF
     File pca_plot = "data_dir/Figures/pca_plot.png"
     File correlation_heatmap = "data_dir/Figures/correlation_heatmap.png"
     File qc_flags_csv = "data_dir/Figures/qc_flags.csv"
+    File alignment_rate_histogram = "data_dir/Figures/alignment_rates.png"
     Array[File] deseq2_results = glob("deseq2_results/*/*.csv")
     Array[File] volcano_pngs = glob("volcano_plots/*/*.png")
     File metrics_json = "metrics.json"
@@ -631,6 +692,170 @@ PYEOF
   }
 }
 
+task generate_report {
+  input {
+    String experiment_name
+    String reference_build
+    File metadata_all_csv
+    File metrics_json
+    File alignment_rate_histogram
+    Array[File] volcano_pngs
+    Array[String] set_names
+    Array[File] set_metadata_csvs
+    String output_directory
+    String docker
+  }
+
+  command <<<
+    set -euo pipefail
+    python3 <<'PYEOF'
+import json
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_pdf import PdfPages
+
+EXPERIMENT = "~{experiment_name}"
+REFERENCE = "~{reference_build}"
+ORGANISM = "Mouse" if "GRCm" in REFERENCE else "Human" if "GRCh" in REFERENCE else REFERENCE
+
+meta = pd.read_csv("~{metadata_all_csv}")
+with open("~{metrics_json}") as f:
+    metrics = json.load(f)
+
+set_names = "~{sep=',' set_names}".split(",")
+set_metadata_paths = "~{sep=',' set_metadata_csvs}".split(",")
+set_metadata = {n: pd.read_csv(p) for n, p in zip(set_names, set_metadata_paths)}
+
+volcano_paths = "~{sep=',' volcano_pngs}".split(",")
+volcano_by_comparison = {}
+for p in volcano_paths:
+    import os
+    fname = os.path.basename(p)
+    if fname.endswith("_volcano.png"):
+        volcano_by_comparison[fname[:-len("_volcano.png")]] = p
+
+pdf = PdfPages("~{experiment_name}_report.pdf")
+
+fig = plt.figure(figsize=(11, 8.5))
+fig.text(0.1, 0.65, "Bulk RNA-seq Analysis", fontsize=28, weight="bold")
+fig.text(0.1, 0.57, EXPERIMENT, fontsize=16)
+fig.text(0.1, 0.50, f"{ORGANISM} ({REFERENCE})  ·  {len(meta)} samples  ·  {meta['Sample_Group'].nunique()} groups", fontsize=12)
+fig.text(0.1, 0.44, "Alignment: STAR/RSEM (jgould bulk_rna_seq)  ·  DE: DESeq2", fontsize=12)
+pdf.savefig(fig)
+plt.close(fig)
+
+aln = metrics.get("alignment_summary", {})
+fig = plt.figure(figsize=(11, 8.5))
+fig.text(0.07, 0.93, "STAR Alignment Rate — Distribution", fontsize=18, weight="bold")
+if aln:
+    ax_img = fig.add_axes([0.15, 0.25, 0.7, 0.6])
+    ax_img.imshow(plt.imread("~{alignment_rate_histogram}"))
+    ax_img.axis("off")
+    stats_line = f"n = {len(metrics['alignment_rates'])} samples   |   mean {aln['mean_pct']:.1f}%   |   SD {aln['std_pct']:.1f}%   |   range {aln['min_pct']:.1f}% - {aln['max_pct']:.1f}%"
+    fig.text(0.07, 0.17, stats_line, fontsize=11)
+    if aln.get("low_mean_warning"):
+        fig.text(0.07, 0.12, "Overall rate is below the typical 70-85% range for this reference/pipeline.", fontsize=11, color="firebrick")
+pdf.savefig(fig)
+plt.close(fig)
+
+if aln:
+    rates = sorted(metrics["alignment_rates"], key=lambda r: r["pct_uniquely_mapped"] or 0)
+    outlier_set = set(aln.get("outlier_samples", []))
+    fig = plt.figure(figsize=(11, 8.5))
+    fig.text(0.07, 0.93, "STAR Alignment Rate — Per Sample", fontsize=18, weight="bold")
+    fig.text(0.07, 0.89, "Uniquely mapped reads %, sorted ascending. * = outlier (>2 SD below run mean)", fontsize=10)
+    half = (len(rates) + 1) // 2
+    for col, chunk in enumerate([rates[:half], rates[half:]]):
+        rows = [[r["sample"] + (" *" if r["sample"] in outlier_set else ""), f"{r['pct_uniquely_mapped']:.2f}%"] for r in chunk]
+        ax = fig.add_axes([0.07 + col * 0.47, 0.05, 0.42, 0.78])
+        ax.axis("off")
+        tbl = ax.table(cellText=rows, colLabels=["Sample", "% Uniquely Mapped"], loc="center", cellLoc="left")
+        tbl.auto_set_font_size(False)
+        tbl.set_fontsize(8)
+    pdf.savefig(fig)
+    plt.close(fig)
+
+for comp in metrics.get("deseq2_volcano_summary", []):
+    key = comp["comparison"]
+    if key not in volcano_by_comparison:
+        continue
+    numer, denom = comp["numerator"], comp["reference"]
+    set_name = comp["set_name"]
+    set_meta = set_metadata.get(set_name, meta)
+
+    fig = plt.figure(figsize=(11, 8.5))
+    fig.text(0.07, 0.93, f"{numer}  vs  {denom}", fontsize=18, weight="bold")
+    ax_img = fig.add_axes([0.05, 0.08, 0.55, 0.78])
+    ax_img.imshow(plt.imread(volcano_by_comparison[key]))
+    ax_img.axis("off")
+
+    y = 0.80
+    fig.text(0.65, y, "Comparison", fontsize=12, weight="bold"); y -= 0.04
+    fig.text(0.65, y, f"{numer} vs {denom}", fontsize=10); y -= 0.03
+    fig.text(0.65, y, f"(log2FC > 0 = higher in {numer})", fontsize=9); y -= 0.07
+
+    fig.text(0.65, y, "Samples included", fontsize=12, weight="bold"); y -= 0.04
+    for group in (numer, denom):
+        members = set_meta[set_meta["Sample_Group"] == group]["Sample_Name"].tolist()
+        fig.text(0.65, y, f"{group}: {', '.join(members)}  (n={len(members)})", fontsize=9); y -= 0.03
+    y -= 0.04
+
+    fig.text(0.65, y, "Significant genes", fontsize=12, weight="bold"); y -= 0.04
+    fig.text(0.65, y, f"{comp['n_significant']:,}", fontsize=16); y -= 0.03
+    fig.text(0.65, y, "padj <= 0.05 and |log2 fold change| > 1", fontsize=8); y -= 0.06
+
+    excluded = sorted(set(meta["Sample_Name"]) - set(set_meta["Sample_Name"]))
+    if excluded:
+        fig.text(0.65, y, f"Excluded from this comparison: {', '.join(excluded)}", fontsize=8, color="firebrick")
+    else:
+        fig.text(0.65, y, "All samples included - none excluded from this comparison.", fontsize=8)
+    pdf.savefig(fig)
+    plt.close(fig)
+
+fig = plt.figure(figsize=(11, 8.5))
+fig.text(0.07, 0.93, "QC Notes", fontsize=18, weight="bold")
+y = 0.85
+if aln:
+    fig.text(0.07, y, "STAR alignment", fontsize=12, weight="bold"); y -= 0.04
+    outliers = aln.get("outlier_samples", [])
+    line = f"Overall mean uniquely-mapped rate was {aln['mean_pct']:.1f}%."
+    fig.text(0.07, y, line, fontsize=10); y -= 0.03
+    if outliers:
+        fig.text(0.07, y, f"Outlier samples (>2 SD below run mean): {', '.join(outliers)}", fontsize=10); y -= 0.03
+    y -= 0.04
+
+qc_flags = metrics.get("qc_flags", [])
+if qc_flags:
+    fig.text(0.07, y, "Library size / PCA QC", fontsize=12, weight="bold"); y -= 0.04
+    for flag in qc_flags:
+        fig.text(0.07, y, f"{flag.get('sample','')}: {flag.get('check','')} — {flag.get('detail','')}", fontsize=9); y -= 0.03
+    y -= 0.04
+else:
+    fig.text(0.07, y, "Library size / PCA QC: no flags raised.", fontsize=10); y -= 0.06
+
+pdf.savefig(fig)
+plt.close(fig)
+
+pdf.close()
+PYEOF
+
+    gsutil cp "~{experiment_name}_report.pdf" "~{sub(output_directory, "/$", "")}/results/"
+  >>>
+
+  output {
+    File report_pdf = "~{experiment_name}_report.pdf"
+  }
+
+  runtime {
+    docker: docker
+    cpu: 2
+    memory: "4 GB"
+    disks: "local-disk 20 HDD"
+  }
+}
+
 task delocalize_outputs {
   input {
     String output_directory
@@ -640,6 +865,7 @@ task delocalize_outputs {
     File pca_plot
     File correlation_heatmap
     File qc_flags_csv
+    File alignment_rate_histogram
     Array[File] deseq2_results
     Array[File] volcano_pngs
     File metrics_json
@@ -653,7 +879,7 @@ task delocalize_outputs {
 
     gsutil cp "~{fastq_table_tsv}" "$DEST/"
     gsutil cp "~{count_ensembl_csv}" "~{count_geneID_csv}" "$DEST/"
-    gsutil cp "~{pca_plot}" "~{correlation_heatmap}" "$DEST/figures/"
+    gsutil cp "~{pca_plot}" "~{correlation_heatmap}" "~{alignment_rate_histogram}" "$DEST/figures/"
     gsutil cp "~{qc_flags_csv}" "~{metrics_json}" "~{warnings_log}" "$DEST/"
     gsutil -m cp ~{sep=" " deseq2_results} "$DEST/deseq2/"
     gsutil -m cp ~{sep=" " volcano_pngs} "$DEST/figures/"
