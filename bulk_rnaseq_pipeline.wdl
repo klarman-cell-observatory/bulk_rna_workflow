@@ -154,6 +154,9 @@ workflow bulk_rnaseq_pipeline {
     input:
       output_directory = output_directory_gcs,
       fastq_table_tsv = build_fastq_table.fastq_table_tsv,
+      rsem_gene_results = rsem_gene_results,
+      rsem_isoform_results = rsem_isoform_results,
+      aligner_logs = aligner_logs,
       count_ensembl_csv = analysis.count_ensembl_csv,
       count_geneID_csv = analysis.count_geneID_csv,
       pca_plot = analysis.pca_plot,
@@ -860,6 +863,9 @@ task delocalize_outputs {
   input {
     String output_directory
     File fastq_table_tsv
+    Array[File] rsem_gene_results
+    Array[File] rsem_isoform_results
+    Array[File] aligner_logs
     File count_ensembl_csv
     File count_geneID_csv
     File pca_plot
@@ -878,6 +884,9 @@ task delocalize_outputs {
     DEST="~{sub(output_directory, "/$", "")}/results"
 
     gsutil cp "~{fastq_table_tsv}" "$DEST/"
+    gsutil -m cp ~{sep=" " rsem_gene_results} "$DEST/rsem/"
+    gsutil -m cp ~{sep=" " rsem_isoform_results} "$DEST/rsem/"
+    gsutil -m cp ~{sep=" " aligner_logs} "$DEST/rsem/"
     gsutil cp "~{count_ensembl_csv}" "~{count_geneID_csv}" "$DEST/"
     gsutil cp "~{pca_plot}" "~{correlation_heatmap}" "~{alignment_rate_histogram}" "$DEST/figures/"
     gsutil cp "~{qc_flags_csv}" "~{metrics_json}" "~{warnings_log}" "$DEST/"
