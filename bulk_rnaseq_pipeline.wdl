@@ -31,10 +31,7 @@ workflow bulk_rnaseq_pipeline {
     Boolean output_genome_bam = false
 
     Boolean run_alignment
-    Array[File]? existing_rsem_gene_results
-    Array[File]? existing_rsem_isoform_results
-    Array[File]? existing_aligner_logs
-    Array[String]? existing_sample_names
+    String? existing_results_directory
 
     Float deseq2_padj_thresh = 0.05
     Float deseq2_lfc_thresh = 1.0
@@ -47,6 +44,7 @@ workflow bulk_rnaseq_pipeline {
 
   String input_bcl_directory_gcs = if sub(input_bcl_directory, "^gs://.*", "MATCH") == "MATCH" then input_bcl_directory else "gs://" + input_bcl_directory
   String output_directory_gcs = if sub(output_directory, "^gs://.*", "MATCH") == "MATCH" then output_directory else "gs://" + output_directory
+  String existing_results_directory_gcs = if defined(existing_results_directory) then (if sub(select_first([existing_results_directory]), "^gs://.*", "MATCH") == "MATCH" then select_first([existing_results_directory]) else "gs://" + select_first([existing_results_directory])) else ""
 
   call generate_bcl_samplesheet {
     input:
@@ -114,10 +112,19 @@ workflow bulk_rnaseq_pipeline {
     }
   }
 
-  Array[File] rsem_gene_results = select_first([bulk_rna_seq.rsem_gene, existing_rsem_gene_results])
-  Array[File] rsem_isoform_results = select_first([bulk_rna_seq.rsem_isoform, existing_rsem_isoform_results])
-  Array[File] aligner_logs = select_first([bulk_rna_seq.aligner_log, existing_aligner_logs])
-  Array[String] sample_names_final = if run_alignment then build_fastq_table.sample_names_ordered else select_first([existing_sample_names])
+  if (!run_alignment) {
+    call discover_existing_rsem_results {
+      input:
+        results_directory = existing_results_directory_gcs,
+        sample_names = build_fastq_table.sample_names_ordered,
+        docker = downstream_docker
+    }
+  }
+
+  Array[File] rsem_gene_results = if run_alignment then select_first([bulk_rna_seq.rsem_gene]) else discover_existing_rsem_results.gene_results
+  Array[File] rsem_isoform_results = if run_alignment then select_first([bulk_rna_seq.rsem_isoform]) else discover_existing_rsem_results.isoform_results
+  Array[File] aligner_logs = if run_alignment then select_first([bulk_rna_seq.aligner_log]) else discover_existing_rsem_results.aligner_logs
+  Array[String] sample_names_final = build_fastq_table.sample_names_ordered
 
   call analysis {
     input:
@@ -153,6 +160,7 @@ workflow bulk_rnaseq_pipeline {
   call delocalize_outputs {
     input:
       output_directory = output_directory_gcs,
+      copy_rsem_outputs = run_alignment,
       fastq_table_tsv = build_fastq_table.fastq_table_tsv,
       rsem_gene_results = rsem_gene_results,
       rsem_isoform_results = rsem_isoform_results,
@@ -477,6 +485,88 @@ PYEOF
 
   output {
     Boolean attempted = true
+  }
+
+  runtime {
+    docker: docker
+    cpu: 1
+    memory: "2 GB"
+    disks: "local-disk 10 HDD"
+  }
+}
+
+task discover_existing_rsem_results {
+  input {
+    String results_directory
+    Array[String] sample_names
+    String docker
+  }
+
+  command <<<
+    set -euo pipefail
+    RESULTS_DIR="~{sub(results_directory, "/$", "")}/rsem"
+    gsutil ls "${RESULTS_DIR}/**" > rsem_files.txt || true
+
+    python3 <<'PYEOF'
+import os
+import subprocess
+import sys
+
+samples = ~{write_json(sample_names)}
+with open("rsem_files.txt") as f:
+    paths = [line.strip() for line in f if line.strip()]
+
+# Files are delocalized into results/rsem/. Match by exact sample-name prefix
+# plus a recognized suffix to avoid accidental partial-name matches.
+def matches_for(sample, kind):
+    if kind == "gene":
+        suffixes = (".genes.results", "_genes.results", ".gene.results")
+    elif kind == "isoform":
+        suffixes = (".isoforms.results", "_isoforms.results", ".isoform.results")
+    else:
+        suffixes = ("Log.final.out", ".Log.final.out", "_Log.final.out")
+    found = []
+    for path in paths:
+        base = os.path.basename(path)
+        if any(base == sample + suffix or base.startswith(sample + suffix) for suffix in suffixes):
+            found.append(path)
+        elif kind == "log" and base.startswith(sample) and "Log.final.out" in base:
+            found.append(path)
+    return sorted(set(found))
+
+out = {"gene": [], "isoform": [], "log": []}
+problems = []
+for sample in samples:
+    for kind in out:
+        found = matches_for(sample, kind)
+        if len(found) != 1:
+            problems.append(f"{sample}: expected exactly one {kind} file under results/rsem, found {len(found)}: {found}")
+        else:
+            out[kind].append(found[0])
+
+if problems:
+    print("Could not resolve existing RSEM results from the supplied results directory:", file=sys.stderr)
+    print("\n".join(problems), file=sys.stderr)
+    print("Expected files under results/rsem/ with sample-name-prefixed names, e.g. SAMPLE.genes.results, SAMPLE.isoforms.results, and SAMPLE.Log.final.out.", file=sys.stderr)
+    sys.exit(1)
+
+# Localize selected GCS files so WDL can expose them as File outputs.
+for key, values in out.items():
+    local_paths = []
+    for i, uri in enumerate(values):
+        basename = os.path.basename(uri)
+        local_path = f"{key}_{i:05d}_{basename}"
+        subprocess.run(["gsutil", "cp", uri, local_path], check=True)
+        local_paths.append(local_path)
+    with open(key + "_paths.txt", "w") as f:
+        f.write("\n".join(local_paths))
+PYEOF
+  >>>
+
+  output {
+    Array[File] gene_results = read_lines("gene_paths.txt")
+    Array[File] isoform_results = read_lines("isoform_paths.txt")
+    Array[File] aligner_logs = read_lines("log_paths.txt")
   }
 
   runtime {
@@ -862,6 +952,7 @@ PYEOF
 task delocalize_outputs {
   input {
     String output_directory
+    Boolean copy_rsem_outputs
     File fastq_table_tsv
     Array[File] rsem_gene_results
     Array[File] rsem_isoform_results
@@ -884,9 +975,11 @@ task delocalize_outputs {
     DEST="~{sub(output_directory, "/$", "")}/results"
 
     gsutil cp "~{fastq_table_tsv}" "$DEST/"
-    gsutil -m cp ~{sep=" " rsem_gene_results} "$DEST/rsem/"
-    gsutil -m cp ~{sep=" " rsem_isoform_results} "$DEST/rsem/"
-    gsutil -m cp ~{sep=" " aligner_logs} "$DEST/rsem/"
+    if [ "~{copy_rsem_outputs}" = "true" ]; then
+      gsutil -m cp ~{sep=" " rsem_gene_results} "$DEST/rsem/"
+      gsutil -m cp ~{sep=" " rsem_isoform_results} "$DEST/rsem/"
+      gsutil -m cp ~{sep=" " aligner_logs} "$DEST/rsem/"
+    fi
     gsutil cp "~{count_ensembl_csv}" "~{count_geneID_csv}" "$DEST/"
     gsutil cp "~{pca_plot}" "~{correlation_heatmap}" "~{alignment_rate_histogram}" "$DEST/figures/"
     gsutil cp "~{qc_flags_csv}" "~{metrics_json}" "~{warnings_log}" "$DEST/"
