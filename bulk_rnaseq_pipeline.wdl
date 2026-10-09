@@ -511,8 +511,12 @@ task discover_existing_rsem_results {
 import os
 import subprocess
 import sys
+import json
 
-samples = ~{write_json(sample_names)}
+samples_json_path = "~{write_json(sample_names)}"
+with open(samples_json_path) as f:
+    samples = json.load(f)
+
 with open("rsem_files.txt") as f:
     paths = [line.strip() for line in f if line.strip()]
 
