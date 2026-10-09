@@ -121,9 +121,20 @@ workflow bulk_rnaseq_pipeline {
     }
   }
 
-  Array[File] rsem_gene_results = if run_alignment then select_first([bulk_rna_seq.rsem_gene, []]) else select_first([discover_existing_rsem_results.gene_results, []])
-  Array[File] rsem_isoform_results = if run_alignment then select_first([bulk_rna_seq.rsem_isoform, []]) else select_first([discover_existing_rsem_results.isoform_results, []])
-  Array[File] aligner_logs = if run_alignment then select_first([bulk_rna_seq.aligner_log, []]) else select_first([discover_existing_rsem_results.aligner_logs, []])
+  Array[File] rsem_gene_results =
+    if run_alignment
+    then select_first([bulk_rna_seq.rsem_gene, []])
+    else select_first([discover_existing_rsem_results.gene_results, []])
+
+  Array[File] rsem_isoform_results =
+    if run_alignment
+    then select_first([bulk_rna_seq.rsem_isoform, []])
+    else select_first([discover_existing_rsem_results.isoform_results, []])
+
+  Array[File] aligner_logs =
+    if run_alignment
+    then select_first([bulk_rna_seq.aligner_log, []])
+    else select_first([discover_existing_rsem_results.aligner_logs, []])
   Array[String] sample_names_final = build_fastq_table.sample_names_ordered
 
   call analysis {
@@ -556,14 +567,8 @@ if problems:
 
 # Localize selected GCS files so WDL can expose them as File outputs.
 for key, values in out.items():
-    local_paths = []
-    for i, uri in enumerate(values):
-        basename = os.path.basename(uri)
-        local_path = f"{key}_{i:05d}_{basename}"
-        subprocess.run(["gsutil", "cp", uri, local_path], check=True)
-        local_paths.append(local_path)
     with open(key + "_paths.txt", "w") as f:
-        f.write("\n".join(local_paths))
+        f.write("\n".join(values))
 PYEOF
   >>>
 
