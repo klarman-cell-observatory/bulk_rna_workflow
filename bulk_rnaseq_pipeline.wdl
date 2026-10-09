@@ -109,7 +109,7 @@ workflow bulk_rnaseq_pipeline {
           aligner = "star",
           output_genome_bam = output_genome_bam
       }
-    }
+    } 
   }
 
   if (!run_alignment) {
@@ -121,9 +121,9 @@ workflow bulk_rnaseq_pipeline {
     }
   }
 
-  Array[File] rsem_gene_results = if run_alignment then select_first([bulk_rna_seq.rsem_gene]) else discover_existing_rsem_results.gene_results
-  Array[File] rsem_isoform_results = if run_alignment then select_first([bulk_rna_seq.rsem_isoform]) else discover_existing_rsem_results.isoform_results
-  Array[File] aligner_logs = if run_alignment then select_first([bulk_rna_seq.aligner_log]) else discover_existing_rsem_results.aligner_logs
+  Array[File] rsem_gene_results = if run_alignment then select_first([bulk_rna_seq.rsem_gene, []]) else discover_existing_rsem_results.gene_results
+  Array[File] rsem_isoform_results = if run_alignment then select_first([bulk_rna_seq.rsem_isoform, []]) else discover_existing_rsem_results.isoform_results
+  Array[File] aligner_logs = if run_alignment then select_first([bulk_rna_seq.aligner_log, []]) else discover_existing_rsem_results.aligner_logs
   Array[String] sample_names_final = build_fastq_table.sample_names_ordered
 
   call analysis {
