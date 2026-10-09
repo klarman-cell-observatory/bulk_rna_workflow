@@ -528,9 +528,9 @@ def matches_for(sample, kind):
     elif kind == "isoform":
         suffixes = (".isoforms.results", "_isoforms.results", ".isoform.results")
     else:
-        suffixes = ("Log.final.out", ".Log.final.out", "_Log.final.out")
+        suffixes = (".log",)
     found = []
-    for path in paths:
+    for path in paths:  
         base = os.path.basename(path)
         if any(base == sample + suffix or base.startswith(sample + suffix) for suffix in suffixes):
             found.append(path)
